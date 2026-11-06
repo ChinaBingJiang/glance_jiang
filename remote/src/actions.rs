@@ -1,0 +1,144 @@
+//! What the phone may ask of this PC besides its lights: the screens off,
+//! sleep, the sound's level, and the power plan. Each as any program of the
+//! user's may do it: none needs administrator rights.
+
+use windows::core::{Result, GUID};
+use windows::Win32::Foundation::HLOCAL;
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::System::Com::{CoCreateInstance, CoIncrementMTAUsage, CLSCTX_ALL};
+use windows::Win32::System::Power::{
+    GetPwrCapabilities, GetSystemPowerStatus, PowerEnumerate, PowerGetActiveScheme, PowerReadFriendlyName, PowerSetActiveScheme, SetSuspendState, ACCESS_SCHEME, SYSTEM_POWER_CAPABILITIES,
+    SYSTEM_POWER_STATUS,
+};
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+/// Windows' own "Power saver" plan.
+pub const POWER_SAVER: GUID = GUID::from_u128(0xa1841308_3541_4fab_bc81_f71556f20b4a);
+
+/// Whether this PC is a laptop: one with a battery of its own.
+pub fn laptop() -> bool {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    // (128: no system battery; 255: not known.)
+    unsafe { GetSystemPowerStatus(&mut status) }.is_ok() && status.BatteryFlag != 128 && status.BatteryFlag != 255
+}
+
+/// Whether this PC stands by with its screens ("modern standby": always
+/// on, always connected): one whose screens Windows cannot put out and
+/// leave the PC as it is. It stands by as they go out, and is signed in to
+/// again as they come on.
+pub fn stands_by_with_its_screens() -> bool {
+    let mut can = SYSTEM_POWER_CAPABILITIES::default();
+    let read = unsafe { GetPwrCapabilities(&mut can) };
+    read && can.AoAc
+}
+
+/// The PC to sleep (not hibernation), letting what is running hear of it.
+pub fn sleep() -> bool {
+    unsafe { SetSuspendState(false, false, false) }
+}
+
+/// The power plan in use.
+pub fn power_plan() -> Option<GUID> {
+    let mut active = std::ptr::null_mut();
+    unsafe {
+        PowerGetActiveScheme(None, &mut active).ok().ok()?;
+        let plan = *active;
+        let _ = windows::Win32::Foundation::LocalFree(Some(HLOCAL(active as *mut _)));
+        Some(plan)
+    }
+}
+
+/// Every power plan this PC has, each with the name Windows shows for it.
+pub fn power_plans() -> Vec<(GUID, String)> {
+    let mut plans = Vec::new();
+    for index in 0.. {
+        let mut plan = GUID::zeroed();
+        let mut size = size_of::<GUID>() as u32;
+        if unsafe { PowerEnumerate(None, None, None, ACCESS_SCHEME, index, Some(&mut plan as *mut GUID as *mut u8), &mut size) }.is_err() {
+            break;
+        }
+        // The name's length (bytes of UTF-16, its end counted), then the name.
+        let mut length = 0u32;
+        let _ = unsafe { PowerReadFriendlyName(None, Some(&plan), None, None, None, &mut length) };
+        let mut name = vec![0u16; length as usize / 2];
+        if unsafe { PowerReadFriendlyName(None, Some(&plan), None, None, Some(name.as_mut_ptr() as *mut u8), &mut length) }.is_ok() {
+            plans.push((plan, String::from_utf16_lossy(&name).trim_end_matches('\0').to_string()));
+        }
+    }
+    plans
+}
+
+pub fn set_power_plan(plan: GUID) -> bool {
+    unsafe { PowerSetActiveScheme(None, Some(&plan)) }.is_ok()
+}
+
+/// The programs running, each by its number and its file's name (none of
+/// them opened: only the list Windows keeps of them is read).
+pub fn programs() -> Vec<(u32, String)> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let mut found = Vec::new();
+    unsafe {
+        let Ok(list) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return found };
+        let mut one = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut more = Process32FirstW(list, &mut one).is_ok();
+        while more {
+            found.push((one.th32ProcessID, String::from_utf16_lossy(&one.szExeFile[..one.szExeFile.iter().position(|c| *c == 0).unwrap_or(one.szExeFile.len())])));
+            more = Process32NextW(list, &mut one).is_ok();
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(list);
+    }
+    found
+}
+
+/// COM for the whole program, for as long as it runs: every thread may use
+/// it. (Kept by each thread for itself, what COM had loaded would be
+/// unloaded some minutes after those threads were gone, under whatever was
+/// still held of it.)
+pub fn com() {
+    static KEPT: std::sync::Once = std::sync::Once::new();
+    KEPT.call_once(|| {
+        let _ = unsafe { CoIncrementMTAUsage() };
+    });
+}
+
+/// The sound's level on the device the sound plays from now.
+fn sound() -> Result<IAudioEndpointVolume> {
+    com();
+    unsafe {
+        let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        devices.GetDefaultAudioEndpoint(eRender, eConsole)?.Activate(CLSCTX_ALL, None)
+    }
+}
+
+/// How loud the sound is (0 to 100), and whether it is muted.
+pub fn volume() -> Option<(u8, bool)> {
+    let sound = sound().ok()?;
+    unsafe { Some(((sound.GetMasterVolumeLevelScalar().ok()? * 100.0).round() as u8, sound.GetMute().ok()?.as_bool())) }
+}
+
+pub fn set_volume(level: Option<u8>, muted: Option<bool>) -> Result<()> {
+    let sound = sound()?;
+    unsafe {
+        if let Some(level) = level {
+            sound.SetMasterVolumeLevelScalar(level.min(100) as f32 / 100.0, std::ptr::null())?;
+        }
+        if let Some(muted) = muted {
+            sound.SetMute(muted, std::ptr::null())?;
+        }
+    }
+    Ok(())
+}
+
+/// Windows' clock of milliseconds, as the time of the last input is told in.
+pub fn tick() -> u32 {
+    unsafe { GetTickCount() }
+}
+
+/// When the mouse or the keyboard was last touched (see `tick`).
+pub fn last_input() -> u32 {
+    let mut info = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    let _ = unsafe { GetLastInputInfo(&mut info) };
+    info.dwTime
+}

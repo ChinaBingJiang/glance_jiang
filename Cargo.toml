@@ -1,0 +1,161 @@
+[package]
+name = "glance"
+version = "0.4.2"
+license = "MIT"
+edition = "2021"
+# `cargo run` runs Glance itself; its sensors (src/bin/glance-sensors.rs) are started by it.
+default-run = "glance"
+
+[lib]
+name = "glance_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+embed-resource = "3"
+
+[features]
+# The studio: the panel drawn off screen, frame by frame, for the video
+# and the README (glance --studio script.json out-folder). Not shipped.
+studio = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Notes' Markdown, parsed as they are written (to show it as it will read).
+pulldown-cmark = { version = "0.13", default-features = false }
+# What is pasted into a note as HTML (a web page's, Word's), read as a browser reads it, to be written as Markdown.
+html5ever = "0.39"
+markup5ever_rcdom = "=0.39.0+unofficial"
+# Inflating what is deflated (zlib): Kugou's lyrics come so.
+miniz_oxide = "0.9"
+
+# macOS's own APIs: the kernel's counters, and IOKit for drives, graphics,
+# sensors and power.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+mach2 = "0.7"
+objc2-core-foundation = "0.3"
+objc2-io-kit = "0.3"
+
+# Windows' own APIs: everything Glance does there, and only there.
+[target.'cfg(windows)'.dependencies]
+windows-numerics = "0.3"
+# For `#[implement]`: the effects handed to Windows' compositor.
+windows-core = "0.62"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Wdk_Graphics_Direct3D",
+    "Wdk_System_Threading",
+    "Foundation",
+    "Foundation_Metadata",
+    "Media_Control",
+    "Storage_Streams",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Graphics_Effects",
+    "Security_Authorization_AppCapabilityAccess",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Bluetooth",
+    "UI_ViewManagement",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Graphics_Imaging",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_EventLog",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Security_AppLocker",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinSock",
+    "Win32_System_HostComputeSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Rpc",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Controls_RichEdit",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_ColorSystem",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# For trying a change on this PC: not optimised, so it builds in seconds and again only where things changed
+# (`cargo build --profile fast`, into target/fast). It runs a little heavier than a release, which is fine for a look;
+# releases are built as above, optimised, whole-crate LTO.
+[profile.fast]
+inherits = "release"
+opt-level = 0
+lto = false
+codegen-units = 256
+incremental = true
+strip = false

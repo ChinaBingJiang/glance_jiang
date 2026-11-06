@@ -1,0 +1,524 @@
+package dev.weiyi.glance.remote
+
+import android.graphics.Typeface
+import android.provider.Settings
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Paint
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+// The PC, drawn: every part a block of its own size in the case, all seen
+// from the same corner (x to the right and down, y to the left and down, z
+// up). The picture is 320 by 254, the case in its middle; what is said of
+// its parts, either side of it.
+private const val COS = 0.8660254f
+private const val LEFT = -190f
+private const val TOP = -148f
+private const val WIDE = 320f
+private const val TALL = 254f
+
+private data class V(val x: Float, val y: Float, val z: Float) {
+    operator fun plus(o: V) = V(x + o.x, y + o.y, z + o.z)
+    operator fun minus(o: V) = V(x - o.x, y - o.y, z - o.z)
+    operator fun times(k: Float) = V(x * k, y * k, z * k)
+    val length get() = sqrt(x * x + y * y + z * z)
+    /** Where it is in the picture. */
+    val flat get() = Offset((x - y) * COS, (x + y) * 0.5f - z)
+}
+
+private fun v(x: Number, y: Number, z: Number) = V(x.toFloat(), y.toFloat(), z.toFloat())
+
+/** A loop of corners in space as a path, each corner rounded by [r] in the plane of its two edges. */
+private fun loop(points: List<V>, r: Float): Path {
+    val path = Path()
+    for (i in points.indices) {
+        val corner = points[i]
+        fun toward(other: V): Offset {
+            val edge = other - corner
+            return (corner + edge * (min(r, edge.length / 2) / edge.length)).flat
+        }
+        val from = toward(points[(i + points.size - 1) % points.size])
+        val to = toward(points[(i + 1) % points.size])
+        if (i == 0) path.moveTo(from.x, from.y) else path.lineTo(from.x, from.y)
+        path.quadraticTo(corner.flat.x, corner.flat.y, to.x, to.y)
+    }
+    path.close()
+    return path
+}
+
+/** A face of something: a flat drawing laid on it from its corner [o], across [u] and along [v]. */
+private class Face(val o: V, val u: V, val v: V) {
+    fun at(x: Float, y: Float) = (o + u * x + v * y).flat
+
+    fun circle(r: Float): Path {
+        val k = 0.5522848f * r
+        val path = Path()
+        fun curve(a: Offset, b: Offset, c: Offset) = path.cubicTo(a.x, a.y, b.x, b.y, c.x, c.y)
+        at(r, 0f).let { path.moveTo(it.x, it.y) }
+        curve(at(r, k), at(k, r), at(0f, r))
+        curve(at(-k, r), at(-r, k), at(-r, 0f))
+        curve(at(-r, -k), at(-k, -r), at(0f, -r))
+        curve(at(k, -r), at(r, -k), at(r, 0f))
+        path.close()
+        return path
+    }
+
+    fun box(width: Float, height: Float, r: Float) = loop(listOf(o, o + u * width, o + u * width + v * height, o + v * height), r)
+
+    /** The same laying, for what Android draws by itself (words). */
+    fun matrix() = android.graphics.Matrix().apply {
+        val (a, b) = (u.flat.x to u.flat.y)
+        setValues(floatArrayOf(a, v.flat.x, o.flat.x, b, v.flat.y, o.flat.y, 0f, 0f, 1f))
+    }
+}
+
+/** A block with soft corners: what it hides, then its side towards x, its side towards y and its top. */
+private class Block(a: V, b: V, r: Float = 1.6f) {
+    /** Its edge in the picture, all the way round. */
+    val edge = listOf(v(a.x, a.y, b.z), v(b.x, a.y, b.z), v(b.x, a.y, a.z), v(b.x, b.y, a.z), v(a.x, b.y, a.z), v(a.x, b.y, b.z)).map { it.flat }
+    val hidden = Path().apply { edge.forEachIndexed { i, p -> if (i == 0) moveTo(p.x, p.y) else lineTo(p.x, p.y) }; close() }
+    /** Each side, and how much of the block's colour it is filled with. */
+    val sides = listOf(
+        loop(listOf(v(b.x, a.y, a.z), v(b.x, b.y, a.z), v(b.x, b.y, b.z), v(b.x, a.y, b.z)), r) to 0.10f,
+        loop(listOf(v(a.x, b.y, a.z), v(b.x, b.y, a.z), v(b.x, b.y, b.z), v(a.x, b.y, b.z)), r) to 0.05f,
+        loop(listOf(v(a.x, a.y, b.z), v(b.x, a.y, b.z), v(b.x, b.y, b.z), v(a.x, b.y, b.z)), r) to 0.17f,
+    )
+
+    fun holds(p: Offset): Boolean {
+        var inside = false
+        for (i in edge.indices) {
+            val (a, b) = edge[i] to edge[(i + 1) % edge.size]
+            if ((a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) inside = !inside
+        }
+        return inside
+    }
+}
+
+private const val W = 56f
+private const val D = 124f
+private const val H = 128f
+private const val R = 9f
+
+private object Case {
+    /** The inside of the case: its floor, the wall the board is on, the back wall. */
+    val walls = listOf(
+        loop(listOf(v(0, 0, 0), v(W, 0, 0), v(W, D, 0), v(0, D, 0)), R),
+        loop(listOf(v(0, 0, 0), v(0, D, 0), v(0, D, H), v(0, 0, H)), R),
+        loop(listOf(v(0, 0, 0), v(W, 0, 0), v(W, 0, H), v(0, 0, H)), R),
+    )
+    val boardOn = Face(v(0.5, 10, 32), v(0, 1, 0), v(0, 0, 1))
+    val board = boardOn.box(86f, 86f, 3f)
+    val rear = Face(v(W / 2, 0.6, 98), v(1, 0, 0), v(0, 0, 1))
+    /** The power supply's shroud along the bottom, its vents towards the glass. */
+    val shroud = Block(v(2, 2, 2), v(W - 2, D - 2, 24), 3f)
+    val vents = Face(v(W - 2, 18, 8), v(0, 1, 0), v(0, 0, 1))
+    /** A drive lying on the shroud, towards the front. */
+    val disk = Block(v(16, 86, 24), v(46, 114, 28))
+    val diskLid = Face(v(20, 90, 28), v(1, 0, 0), v(0, 1, 0)).box(22f, 20f, 2f)
+    /** The card: long, flat, out from the board; its light along the edge towards the glass. */
+    val gpu = Block(v(0.5, 10, 58), v(42, 102, 72), 2.4f)
+    val gpuTop = Face(v(6, 18, 72), v(1, 0, 0), v(0, 1, 0)).box(30f, 76f, 3f)
+    val gpuLight = v(42, 20, 65).flat to v(42, 92, 65).flat
+    /** The processor's cooler: its fan on top, its little screen saying how warm it is. */
+    val cpu = Block(v(0.5, 28, 86), v(22, 52, 110), 2.4f)
+    val cpuFan = Face(v(11.5, 40, 110.3), v(1, 0, 0), v(0, 1, 0))
+    // (Across towards the back of the case: that way it reads from the left.)
+    val screenOn = Face(v(22, 49, 107), v(0, -1, 0), v(0, 0, -1))
+    val screen = screenOn.box(18f, 18f, 3.5f)
+    val ram = listOf(60f, 66f, 72f, 78f).map { Block(v(0.5, it, 84), v(15, it + 2.4f, 116), 0.8f) }
+    /** The front: three fans behind it. */
+    val front = listOf(38f, 70f, 102f).map { Face(v(W / 2, D - 0.6, it), v(1, 0, 0), v(0, 0, 1)) }
+    /** The case itself, over all of it: three panels with soft corners. */
+    val shell = listOf(
+        loop(listOf(v(0, 0, H), v(W, 0, H), v(W, D, H), v(0, D, H)), R),
+        loop(listOf(v(W, 0, 0), v(W, D, 0), v(W, D, H), v(W, 0, H)), R),
+        loop(listOf(v(0, D, 0), v(W, D, 0), v(W, D, H), v(0, D, H)), R),
+    )
+
+    /** The part under a point of the picture, the nearest the eye first. */
+    fun part(p: Offset): Part? = when {
+        ram.any { it.holds(p) } -> Part.Ram
+        cpu.holds(p) -> Part.Cpu
+        gpu.holds(p) -> Part.Gpu
+        disk.holds(p) -> Part.Disk
+        else -> null
+    }
+}
+
+/** Something flat lying on a face: its outline, and whether a point of the picture is on it. */
+private class Chip(on: Face, wide: Float, deep: Float, r: Float) {
+    val path = on.box(wide, deep, r)
+    val middle = on.at(wide / 2, deep / 2)
+    private val corners = listOf(on.at(0f, 0f), on.at(wide, 0f), on.at(wide, deep), on.at(0f, deep))
+
+    fun holds(p: Offset): Boolean {
+        var inside = false
+        for (i in corners.indices) {
+            val (a, b) = corners[i] to corners[(i + 1) % corners.size]
+            if ((a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) inside = !inside
+        }
+        return inside
+    }
+}
+
+/**
+ * A laptop, drawn as the case is and as one with a clear shell would look: its screen up at the back; in its body,
+ * its board with the processor and the card on it, a pipe from each to its fan, its memory, its drive and its
+ * battery; and over them, faintly, its keys and its pad. In the middle of the picture, as the case is.
+ *
+ * As a laptop of fourteen inches is: its body 104 by 74 (about 312 mm by 222), its lid as deep as its body (shut, it
+ * covers it), opened 18 degrees past upright; its screen 16 by 10 in the lid, the wider edge of the lid under it.
+ * Its body and its lid are drawn thicker than they are, to be seen at this size: the body twice the lid.
+ */
+private object Laptop {
+    private const val X0 = -52f
+    private const val Y0 = 9f
+    private const val WIDE = 104f
+    private const val DEEP = 74f
+    private const val THICK = 6f
+    private const val UP = DEEP * 0.951f
+    private const val LEAN = DEEP * 0.309f
+    private const val LID = 3f
+    /** How far up in the body what is in it lies. */
+    private const val IN = 1.5f
+
+    private val corners = listOf(v(X0, Y0, THICK), v(X0 + WIDE, Y0, THICK), v(X0 + WIDE, Y0 - LEAN, THICK + UP), v(X0, Y0 - LEAN, THICK + UP))
+    private fun behind(corner: V) = v(corner.x, corner.y - LID * UP / DEEP, corner.z - LID * LEAN / DEEP)
+    /** The lid's side towards the eye and its top: it is as thick as [LID]. */
+    val edges = listOf(
+        loop(listOf(corners[1], corners[2], behind(corners[2]), behind(corners[1])), 1f),
+        loop(listOf(corners[3], corners[2], behind(corners[2]), behind(corners[3])), 1f),
+    )
+    val lid = loop(corners, 4f)
+    val display = run {
+        // Up the lid, a step as long as one across it; the screen 3.5 in from its sides and its top.
+        val up = v(0, -LEAN / DEEP, UP / DEEP)
+        val (across, edge) = (WIDE - 7f) to 3.5f
+        val tall = across * 10f / 16f
+        val from = DEEP - edge - tall
+        Face(v(X0 + edge, Y0 + up.y * from, THICK + up.z * from), v(1, 0, 0), up).box(across, tall, 2.5f)
+    }
+    val body = Block(v(X0, Y0, 0), v(X0 + WIDE, Y0 + DEEP, THICK), 2.5f)
+
+    private fun inside(x: Float, y: Float) = Face(v(X0 + x, Y0 + y, IN), v(1, 0, 0), v(0, 1, 0))
+    private fun deck(x: Float, y: Float) = Face(v(X0 + x, Y0 + y, THICK), v(1, 0, 0), v(0, 1, 0))
+    private fun lines(on: Face, each: List<Pair<Offset, Offset>>) = Path().apply {
+        for ((from, to) in each) {
+            on.at(from.x, from.y).let { moveTo(it.x, it.y) }
+            on.at(to.x, to.y).let { lineTo(it.x, it.y) }
+        }
+    }
+
+    /** The board across the back, and the battery before it with its cells. */
+    val board = inside(7f, 4f).box(90f, 33f, 3f)
+    val battery = inside(15f, 43f).box(74f, 21f, 3f)
+    val cells = lines(inside(15f, 43f), listOf(1f, 2f).map { Offset(it * 74f / 3f, 3f) to Offset(it * 74f / 3f, 18f) })
+    /** A pipe from the processor and from the card, each out to its fan. */
+    val pipes = lines(inside(0f, 0f), listOf(Offset(25f, 17f) to Offset(45f, 17f), Offset(25f, 20f) to Offset(45f, 20f), Offset(64f, 17f) to Offset(79f, 17f), Offset(64f, 20f) to Offset(79f, 20f)))
+    val fans = listOf(20f, 84f).map { Face(v(X0 + it, Y0 + 19, IN + 0.2), v(1, 0, 0), v(0, 1, 0)) }
+    val chips = mapOf(
+        Part.Cpu to Chip(inside(37f, 11f), 14f, 14f, 1.6f),
+        Part.Gpu to Chip(inside(54f, 11f), 15f, 14f, 1.6f),
+        Part.Ram to Chip(inside(34f, 28f), 17f, 6f, 1.6f),
+        Part.Disk to Chip(inside(54f, 28f), 22f, 6f, 1.6f),
+    )
+    /** Over them: the keys in their rows (each row's set off from the next's, the last with its long key), and the pad. */
+    val keys = deck(7f, 6f).box(90f, 31f, 2f)
+    val rows = run {
+        val (wide, deep, rows, across) = listOf(90f, 31f, 5f, 13f)
+        val each = mutableListOf<Pair<Offset, Offset>>()
+        for (row in 1 until rows.toInt()) each += Offset(0f, deep * row / rows) to Offset(wide, deep * row / rows)
+        for (row in 0 until rows.toInt()) {
+            val (top, bottom) = (deep * row / rows) to (deep * (row + 1) / rows)
+            val shift = listOf(0f, 0.5f, 0.25f, 0.75f, 0f)[row] * wide / across
+            for (key in 1 until across.toInt()) {
+                val x = key * wide / across + shift
+                if (x < wide - 1f && (row + 1 < rows.toInt() || x !in wide * 0.3f..wide * 0.7f)) each += Offset(x, top) to Offset(x, bottom)
+            }
+        }
+        lines(deck(7f, 6f), each)
+    }
+    val pad = deck(37f, 44f).box(30f, 19f, 2.5f)
+
+    /** Where each note is. */
+    val places = mapOf(
+        Part.Cpu to Place(v(X0 + 44, Y0 + 18, IN), -122f, -104f, true),
+        Part.Gpu to Place(v(X0 + 61.5, Y0 + 18, IN), 74f, -34f, false),
+        Part.Ram to Place(v(X0 + 42.5, Y0 + 31, IN), -134f, 64f, true),
+        Part.Disk to Place(v(X0 + 65, Y0 + 31, IN), 74f, 66f, false),
+    )
+
+    fun part(p: Offset): Part? = chips.entries.firstOrNull { it.value.holds(p) }?.key
+}
+
+/** What is said beside the picture of one thing in it: a figure, and one or two lines under it. */
+class Note(val figure: String, val first: String, val second: String = "")
+
+/** What is said of each part, and of the case's fans. */
+class Notes(val parts: Map<Part, Note>, val fans: Note?)
+
+/** Where each note is: the point of the case its line starts at, where its words are, and whether they end there. */
+private class Place(val from: V, val x: Float, val y: Float, val ends: Boolean)
+
+private val PLACES = mapOf(
+    Part.Cpu to Place(v(22, 36, 100), 66f, -100f, false),
+    Part.Gpu to Place(v(42, 36, 68), 74f, -30f, false),
+    Part.Disk to Place(v(40, 98, 28), 74f, 62f, false),
+    Part.Ram to Place(v(15, 70, 116), -122f, -124f, true),
+)
+private val FANS = Place(v(W / 2, D, 38), -134f, 64f, true)
+
+private val STEEL = Color(0xFF8EA2C0)
+
+/** How long the picture takes to dim and to brighten, and its lights to come on, go out and change colour (ms). */
+private const val TURNING = 600
+
+/** A part is the case's own steel (tinted by the lights), till it runs warm: then amber, then red. */
+private fun heat(temp: Int?, tint: Color) = when {
+    temp == null -> tint
+    temp >= 75 -> Hot
+    temp >= 62 -> Warm
+    else -> tint
+}
+
+private fun shade(color: Color, part: Float) = lerp(Card, color, part)
+
+private fun DrawScope.block(block: Block, color: Color, width: Float) {
+    drawPath(block.hidden, shade(color, 0.08f))
+    for ((side, part) in block.sides) {
+        drawPath(side, shade(color, part))
+        drawPath(side, color, style = Stroke(width, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+/** A fan lying in a face: its ring, its blades (turned by [turned] degrees) and its hub. */
+private fun DrawScope.fan(on: Face, r: Float, turned: Float, color: Color, width: Float) {
+    val stroke = Stroke(width, cap = StrokeCap.Round, join = StrokeJoin.Round)
+    val ring = on.circle(r)
+    drawPath(ring, shade(color, 0.06f))
+    drawPath(ring, color, style = stroke)
+    val blades = Path()
+    for (i in 0 until 7) {
+        val angle = Math.toRadians((turned + i * 360f / 7).toDouble())
+        val (c, s) = cos(angle).toFloat() to sin(angle).toFloat()
+        fun at(x: Float, y: Float) = on.at(x * c - y * s, x * s + y * c)
+        val (from, bend, to) = Triple(at(r * 0.2f, 0f), at(r * 0.55f, -r * 0.42f), at(r * 0.86f, -r * 0.1f))
+        blades.moveTo(from.x, from.y)
+        blades.quadraticTo(bend.x, bend.y, to.x, to.y)
+    }
+    drawPath(blades, color, style = stroke)
+    val hub = on.circle(r * 0.2f)
+    drawPath(hub, Card)
+    drawPath(hub, color, style = stroke)
+}
+
+/** Draws at less than its full strength, as one picture (not each line faded over the others). */
+private inline fun DrawScope.faded(alpha: Float, draw: DrawScope.() -> Unit) {
+    if (alpha >= 1f) return draw()
+    drawIntoCanvas { it.saveLayer(Rect(LEFT, TOP, LEFT + WIDE, TOP + TALL), Paint().apply { this.alpha = alpha }) }
+    draw()
+    drawIntoCanvas { it.restore() }
+}
+
+/**
+ * The PC drawn. [reads] colour its parts by how warm they are and turn its
+ * fans; [notes] are what is said beside it (none: only the picture);
+ * [light] is the lights' colour while they are on, which the whole inside
+ * of the case takes; at [night] it is dim and still. A part pressed is
+ * [choose]n. Whatever of this changes, the picture goes over to it, not at
+ * once. A [laptop] is drawn as one.
+ */
+@Composable
+fun Rig(reads: Reads?, notes: Notes?, light: Color?, night: Boolean, chosen: Part, modifier: Modifier = Modifier, laptop: Boolean = false, choose: (Part) -> Unit) {
+    val asLaptop by rememberUpdatedState(laptop)
+    val picked by rememberUpdatedState(choose)
+    // How far each kind of fan has turned (the case's, the processor's), in degrees.
+    val turned = remember { FloatArray(2) }
+    var frame by remember { mutableLongStateOf(0L) }
+    val speeds by rememberUpdatedState((reads?.caseFan ?: 0) to (reads?.cpuFan ?: 0))
+    val context = LocalContext.current
+    // Still where the phone is set to show no motion.
+    val moving = remember { Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f }
+    val turning = moving && !night && reads != null && ((reads.caseFan ?: 0) > 0 || (reads.cpuFan ?: 0) > 0)
+    LaunchedEffect(turning) {
+        if (!turning) return@LaunchedEffect
+        var last = withFrameNanos { it }
+        while (true) {
+            val now = withFrameNanos { it }
+            val passed = (now - last) / 1e9f
+            last = now
+            // One turn in the picture for sixteen of the fan's: slow enough to be seen turning.
+            turned[0] = (turned[0] + passed * speeds.first * 6f / 16f) % 360f
+            turned[1] = (turned[1] + passed * speeds.second * 6f / 16f) % 360f
+            frame = now
+        }
+    }
+    val words = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+    }
+    // How awake it is (dim at night), how much its lights are on, and their colour (as it last was, while they go out).
+    val wake by animateFloatAsState(if (night) 0f else 1f, tween(TURNING), label = "wake")
+    val lit = light.takeUnless { night }
+    val last = remember { arrayOf(STEEL) }
+    lit?.let { last[0] = it }
+    val glow by animateColorAsState(last[0], tween(TURNING), label = "glow")
+    val shine by animateFloatAsState(if (lit != null) 1f else 0f, tween(TURNING), label = "shine")
+    // What is said beside it, kept while it fades away.
+    val said = remember { arrayOfNulls<Notes>(1) }
+    notes?.let { said[0] = it }
+    val saying by animateFloatAsState(if (notes != null) 1f else 0f, tween(TURNING), label = "saying")
+    Canvas(
+        modifier.pointerInput(Unit) {
+            detectTapGestures { tap ->
+                val k = min(size.width / WIDE, size.height / TALL)
+                val origin = Offset((size.width - WIDE * k) / 2 - LEFT * k, (size.height - TALL * k) / 2 - TOP * k)
+                (if (asLaptop) Laptop.part((tap - origin) / k) else Case.part((tap - origin) / k))?.let { picked(it) }
+            }
+        },
+    ) {
+        frame
+        val k = min(size.width / WIDE, size.height / TALL)
+        val thin = 1.dp.toPx() / k
+        val tint = lerp(STEEL, glow, 0.42f * shine)
+        fun colour(part: Part) = heat(reads?.of(part)?.temp, tint)
+        fun width(part: Part) = if (notes != null && chosen == part) thin * 1.8f else thin
+        withTransform({
+            translate((size.width - WIDE * k) / 2 - LEFT * k, (size.height - TALL * k) / 2 - TOP * k)
+            scale(k, k, Offset.Zero)
+        }) {
+            faded(0.4f + 0.6f * wake) {
+                val stroke = Stroke(thin, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                if (laptop) {
+                    val shell = lerp(Color(0xFF8F99A6), glow, 0.22f * shine)
+                    val traced = Color(0xFF46505C)
+                    // The screen at the back: its lid's edges, its face, and the picture's place in it.
+                    for (edge in Laptop.edges) {
+                        drawPath(edge, shade(shell, 0.12f))
+                        drawPath(edge, shell, style = stroke)
+                    }
+                    drawPath(Laptop.lid, Color(0xFF12161B))
+                    drawPath(Laptop.lid, shell, style = Stroke(thin * 1.4f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    drawPath(Laptop.display, Color(0xFF0B0E12))
+                    drawPath(Laptop.display, Color(0xFF3A424D), style = stroke)
+                    // The body, clear: what is in it lies on its floor, seen through its deck.
+                    block(Laptop.body, shell, thin)
+                    drawPath(Laptop.board, Color(0xFF161B21))
+                    drawPath(Laptop.board, traced, style = stroke)
+                    drawPath(Laptop.battery, Color(0xFF141920))
+                    drawPath(Laptop.battery, traced, style = stroke)
+                    drawPath(Laptop.cells, traced.copy(alpha = 0.7f), style = stroke)
+                    drawPath(Laptop.pipes, Color(0xFF59636F), style = Stroke(thin * 1.6f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    val fans = lerp(Color(0xFF59636F), glow, shine)
+                    for (one in Laptop.fans) fan(one, 11.5f, turned[1], fans, thin)
+                    for ((part, chip) in Laptop.chips) {
+                        drawPath(chip.path, shade(colour(part), 0.16f))
+                        drawPath(chip.path, colour(part), style = Stroke(width(part), cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    }
+                    // Over them, faintly: the keys in their rows, and the pad; brighter while their light is on.
+                    val keys = lerp(Color(0xFF8F99A6), glow, 0.5f * shine).copy(alpha = 0.34f + 0.21f * shine)
+                    drawPath(Laptop.keys, keys, style = stroke)
+                    drawPath(Laptop.rows, keys, style = Stroke(thin * 0.8f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    drawPath(Laptop.pad, keys, style = stroke)
+                    return@faded
+                }
+                // The lights' colour on the walls and the floor.
+                val wall = lerp(Color(0xFF12161B), glow, 0.09f * shine)
+                for (one in Case.walls) {
+                    drawPath(one, wall)
+                    drawPath(one, Color(0xFF3A424D), style = stroke)
+                }
+                // The board, flat on its wall, a few of its lines.
+                drawPath(Case.board, Color(0xFF161B21))
+                drawPath(Case.board, Color(0xFF46505C), style = stroke)
+                for (y in listOf(12f, 20f)) drawLine(Color(0xFF46505C).copy(alpha = 0.55f), Case.boardOn.at(8f, y), Case.boardOn.at(78f, y), thin, StrokeCap.Round)
+                // The fans are lit as the lights are; out, they are the case's grey.
+                val fans = lerp(Color(0xFF59636F), glow, shine)
+                fan(Case.rear, 16f, turned[0], fans, thin)
+                block(Case.shroud, Color(0xFF4A5461), thin)
+                for (i in 0 until 9) drawLine(Color(0xFF4A5461).copy(alpha = 0.7f), Case.vents.at(i * 6f, 0f), Case.vents.at(i * 6f, 10f), thin, StrokeCap.Round)
+
+                block(Case.disk, colour(Part.Disk), width(Part.Disk))
+                drawPath(Case.diskLid, colour(Part.Disk).copy(alpha = 0.5f), style = stroke)
+
+                block(Case.gpu, colour(Part.Gpu), width(Part.Gpu))
+                drawPath(Case.gpuTop, colour(Part.Gpu).copy(alpha = 0.5f), style = stroke)
+                if (shine > 0f) drawLine(glow.copy(alpha = shine), Case.gpuLight.first, Case.gpuLight.second, thin * 2.5f, StrokeCap.Round)
+
+                block(Case.cpu, colour(Part.Cpu), width(Part.Cpu))
+                fan(Case.cpuFan, 8.5f, turned[1], colour(Part.Cpu), thin)
+                drawPath(Case.screen, Color(0xFF0B0E12))
+                drawPath(Case.screen, colour(Part.Cpu), style = stroke)
+                reads?.cpu?.temp?.let { temp ->
+                    drawIntoCanvas {
+                        val canvas = it.nativeCanvas
+                        canvas.save()
+                        canvas.concat(Case.screenOn.matrix())
+                        words.apply { textSize = 8.5f; typeface = Typeface.DEFAULT_BOLD; textAlign = android.graphics.Paint.Align.CENTER; color = colour(Part.Cpu).toArgb() }
+                        canvas.drawText(temp.toString(), 9f, 12.4f, words)
+                        canvas.restore()
+                    }
+                }
+
+                for (stick in Case.ram) block(stick, colour(Part.Ram), width(Part.Ram))
+                for (one in Case.front) fan(one, 15f, turned[0], fans, thin)
+                val shell = lerp(Color(0xFF8F99A6), glow, 0.22f * shine)
+                for (panel in Case.shell) drawPath(panel, shell, style = Stroke(thin * 1.4f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
+            val told = said[0]
+            if (told != null && saying > 0f) {
+                faded((0.55f + 0.45f * wake) * saying) {
+                    fun say(place: Place, note: Note, here: Boolean) {
+                        val from = place.from.flat
+                        val elbow = place.x + if (place.ends) 12f else -12f
+                        val path = Path().apply { moveTo(from.x, from.y); lineTo(elbow, place.y); lineTo(place.x, place.y) }
+                        drawPath(path, Faint, style = Stroke(thin * 0.8f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                        drawCircle(Ink, 2f, from)
+                        val x = place.x + if (place.ends) -5f else 5f
+                        drawIntoCanvas {
+                            val canvas = it.nativeCanvas
+                            words.textAlign = if (place.ends) android.graphics.Paint.Align.RIGHT else android.graphics.Paint.Align.LEFT
+                            words.apply { textSize = 15f; typeface = Typeface.DEFAULT_BOLD; color = (if (here) Accent else Ink).toArgb() }
+                            canvas.drawText(note.figure, x, place.y + 1f, words)
+                            words.apply { textSize = 9.5f; typeface = Typeface.DEFAULT; color = Dim.toArgb() }
+                            canvas.drawText(note.first, x, place.y + 13f, words)
+                            if (note.second.isNotEmpty()) canvas.drawText(note.second, x, place.y + 25f, words)
+                        }
+                    }
+                    for ((part, place) in if (laptop) Laptop.places else PLACES) told.parts[part]?.let { say(place, it, chosen == part) }
+                    if (!laptop) told.fans?.let { say(FANS, it, false) }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,503 @@
+//! Docker, as its engine reports it: the containers running and what each
+//! uses, asked of the engine the Docker CLI's current context points at,
+//! through its read-only API, on a thread of its own (an engine slow to
+//! answer holds up nothing else), while the module is on.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+
+use crate::reading::{ContainerSample, DockerSample};
+
+/// How long an answer may take before the engine is taken as not answering.
+const PATIENCE: Duration = Duration::from_secs(5);
+/// The most an answer may hold (a container's statistics are a few
+/// kilobytes; the list, some per container).
+const MOST: usize = 8 << 20;
+
+pub struct Docker {
+    latest: Arc<Mutex<Option<DockerSample>>>,
+    stop: Arc<AtomicBool>,
+    /// When the request under way began, if one is.
+    asking: Arc<Mutex<Option<Instant>>>,
+    /// How often the engine is asked (ms): as often as Glance samples.
+    every: Arc<AtomicU64>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+impl Docker {
+    /// Asked every `interval` (see `pace`).
+    pub fn new(interval: Duration) -> Self {
+        let latest = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let asking = Arc::new(Mutex::new(None));
+        let every = Arc::new(AtomicU64::new(interval.as_millis() as u64));
+        let (shared, stopping, busy, pace) = (latest.clone(), stop.clone(), asking.clone(), every.clone());
+        let worker = std::thread::spawn(move || {
+            let mut before: HashMap<String, Counters> = HashMap::new();
+            while !stopping.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let sample = read(&mut before, &busy, &stopping);
+                if stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+                *shared.lock().unwrap() = Some(sample);
+                let every = Duration::from_millis(pace.load(Ordering::Relaxed));
+                std::thread::sleep(every.saturating_sub(started.elapsed()));
+            }
+        });
+        Docker { latest, stop, asking, every, worker }
+    }
+
+    /// Asked every `interval` from now on.
+    pub fn pace(&self, interval: Duration) {
+        self.every.store(interval.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// What was read last; none until the first answer. A request under way
+    /// longer than it may take is cut short (a pipe has no time limit of
+    /// its own).
+    pub fn read(&self) -> Option<DockerSample> {
+        if self.asking.lock().unwrap().is_some_and(|since| since.elapsed() > PATIENCE) {
+            self.cancel();
+        }
+        self.latest.lock().unwrap().clone()
+    }
+
+    /// Ends the worker's blocking read or write, if it is in one.
+    fn cancel(&self) {
+        use std::os::windows::io::AsRawHandle;
+        let thread = windows::Win32::Foundation::HANDLE(self.worker.as_raw_handle());
+        let _ = unsafe { windows::Win32::System::IO::CancelSynchronousIo(thread) };
+    }
+}
+
+impl Drop for Docker {
+    fn drop(&mut self) {
+        // The worker stops: told to, and its requests cut short until it
+        // has (one it was about to make as it was told is cut short too),
+        // by a thread of its own that outlives this.
+        self.stop.store(true, Ordering::Relaxed);
+        let worker = std::mem::replace(&mut self.worker, std::thread::spawn(|| {}));
+        std::thread::spawn(move || {
+            use std::os::windows::io::AsRawHandle;
+            let thread = windows::Win32::Foundation::HANDLE(worker.as_raw_handle());
+            while !worker.is_finished() {
+                let _ = unsafe { windows::Win32::System::IO::CancelSynchronousIo(thread) };
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+}
+
+/// Where the engine is, as the Docker CLI finds it: the context named by
+/// DOCKER_CONTEXT, else DOCKER_HOST, else the current context.
+struct Endpoint {
+    context: String,
+    host: String,
+}
+
+fn endpoint() -> Endpoint {
+    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from).unwrap_or_default();
+    let docker = std::env::var_os("DOCKER_CONFIG").map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".docker"));
+    let named = std::env::var("DOCKER_CONTEXT").ok().filter(|name| !name.is_empty());
+    let host = std::env::var("DOCKER_HOST").ok().filter(|host| !host.is_empty());
+    if let (None, Some(host)) = (&named, &host) {
+        return Endpoint { context: "default".into(), host: host.clone() };
+    }
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(rename = "currentContext", default)]
+        current: String,
+    }
+    let context = named.unwrap_or_else(|| {
+        std::fs::read(docker.join("config.json")).ok().and_then(|bytes| serde_json::from_slice::<Config>(&bytes).ok()).map(|config| config.current).unwrap_or_default()
+    });
+    let default = || Endpoint { context: "default".into(), host: "npipe:////./pipe/docker_engine".into() };
+    if context.is_empty() || context == "default" {
+        return default();
+    }
+    // A context's endpoint, in its metadata (found by its name).
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Meta {
+        name: String,
+        endpoints: HashMap<String, MetaEndpoint>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct MetaEndpoint {
+        #[serde(default)]
+        host: String,
+    }
+    let found = std::fs::read_dir(docker.join("contexts").join("meta")).into_iter().flatten().flatten().find_map(|dir| {
+        let meta: Meta = serde_json::from_slice(&std::fs::read(dir.path().join("meta.json")).ok()?).ok()?;
+        (meta.name == context).then(|| meta.endpoints.get("docker").map(|e| e.host.clone()).unwrap_or_default())
+    });
+    match found {
+        Some(host) => Endpoint { context, host },
+        None => default(),
+    }
+}
+
+/// A connection to the engine: a named pipe on this machine, or plain TCP.
+enum Connection {
+    Pipe(std::fs::File),
+    Tcp(std::net::TcpStream),
+}
+
+impl Connection {
+    /// Opened to `host`; none for a kind of address this does not reach
+    /// (ssh, TLS), and an error for one it could not.
+    fn open(host: &str) -> Option<std::io::Result<Connection>> {
+        if let Some(pipe) = host.strip_prefix("npipe://") {
+            use std::os::windows::fs::OpenOptionsExt;
+            // A pipe on this machine and nothing else: a context pointing
+            // anywhere else (a file) is not one Glance, elevated, opens.
+            let Some(path) = pipe_path(pipe) else { return Some(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a pipe on this machine"))) };
+            // Whoever serves the pipe may tell who asks, not act as them.
+            const SECURITY_IDENTIFICATION: u32 = 1 << 16;
+            let opened = std::fs::OpenOptions::new().read(true).write(true).security_qos_flags(SECURITY_IDENTIFICATION).open(path);
+            return Some(opened.map(Connection::Pipe));
+        }
+        if let Some(address) = host.strip_prefix("tcp://") {
+            let opened = std::net::TcpStream::connect(address.trim_end_matches('/')).and_then(|stream| {
+                stream.set_read_timeout(Some(PATIENCE))?;
+                stream.set_write_timeout(Some(PATIENCE))?;
+                Ok(stream)
+            });
+            return Some(opened.map(Connection::Tcp));
+        }
+        None
+    }
+
+    /// GET `path`: the answer's status and body.
+    fn get(mut self, path: &str) -> std::io::Result<(u16, Vec<u8>)> {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: docker\r\nUser-Agent: Glance\r\nConnection: close\r\n\r\n");
+        let mut answer = Vec::new();
+        match &mut self {
+            Connection::Pipe(pipe) => {
+                pipe.write_all(request.as_bytes())?;
+                read_all(pipe, &mut answer)?;
+            }
+            Connection::Tcp(stream) => {
+                stream.write_all(request.as_bytes())?;
+                read_all(stream, &mut answer)?;
+            }
+        }
+        parse(&answer)
+    }
+}
+
+/// Whether `id` is a container's id as Docker makes them: hexadecimal, 12
+/// (short) to 64 characters.
+fn is_container_id(id: &str) -> bool {
+    (12..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The path of the pipe an `npipe://` address names (`//./pipe/name`, the
+/// slashes as the CLI writes them): a pipe on this machine, its name plain,
+/// or none.
+fn pipe_path(address: &str) -> Option<String> {
+    let name = address.trim_start_matches('/').strip_prefix("./pipe/")?;
+    let plain = !name.is_empty() && name != "." && name != ".." && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    plain.then(|| format!(r"\\.\pipe\{name}"))
+}
+
+/// Everything until the other end closes (a pipe closed says so as an
+/// error), up to `MOST`: an answer longer is not one.
+fn read_all(from: &mut impl Read, into: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut chunk = [0u8; 16 << 10];
+    loop {
+        match from.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                if into.len() + n > MOST {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "an answer past its bound"));
+                }
+                into.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) if error.raw_os_error() == Some(109) && !into.is_empty() => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// An HTTP/1.1 answer's status and body, its chunks joined.
+fn parse(answer: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not an HTTP answer");
+    let split = answer.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(bad)?;
+    let head = std::str::from_utf8(&answer[..split]).map_err(|_| bad())?;
+    let body = &answer[split + 4..];
+    let status: u16 = head.split(' ').nth(1).and_then(|code| code.parse().ok()).ok_or_else(bad)?;
+    let chunked = head.lines().any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding:") && line.to_ascii_lowercase().contains("chunked"));
+    if !chunked {
+        return Ok((status, body.to_vec()));
+    }
+    let (mut joined, mut rest) = (Vec::new(), body);
+    loop {
+        let end = rest.windows(2).position(|w| w == b"\r\n").ok_or_else(bad)?;
+        let size = usize::from_str_radix(std::str::from_utf8(&rest[..end]).map_err(|_| bad())?.split(';').next().unwrap_or("").trim(), 16).map_err(|_| bad())?;
+        rest = &rest[end + 2..];
+        if size == 0 {
+            return Ok((status, joined));
+        }
+        joined.extend_from_slice(rest.get(..size).ok_or_else(bad)?);
+        rest = rest.get(size + 2..).ok_or_else(bad)?;
+    }
+}
+
+/// GET `path` from the engine at `host`, its body read as JSON; `asking`
+/// says when it began, while it is under way.
+fn ask<T: for<'a> Deserialize<'a>>(host: &str, path: &str, asking: &Mutex<Option<Instant>>) -> std::io::Result<Option<T>> {
+    *asking.lock().unwrap() = Some(Instant::now());
+    let answer = Connection::open(host).map(|connection| connection.and_then(|connection| connection.get(path)));
+    *asking.lock().unwrap() = None;
+    let Some(answer) = answer else { return Ok(None) };
+    let (status, body) = answer?;
+    if status != 200 {
+        return Err(std::io::Error::other(format!("{path}: {status}")));
+    }
+    serde_json::from_slice(&body).map(Some).map_err(std::io::Error::other)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Listed {
+    id: String,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Stats {
+    cpu_stats: CpuStats,
+    memory_stats: MemoryStats,
+    networks: Option<HashMap<String, Network>>,
+    blkio_stats: Blkio,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CpuStats {
+    cpu_usage: CpuUsage,
+    system_cpu_usage: Option<u64>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CpuUsage {
+    total_usage: u64,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct MemoryStats {
+    usage: Option<u64>,
+    limit: Option<u64>,
+    stats: HashMap<String, u64>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Network {
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Blkio {
+    io_service_bytes_recursive: Option<Vec<BlkioEntry>>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BlkioEntry {
+    op: String,
+    value: u64,
+}
+
+/// A container's running totals, at a moment: what its rates are worked
+/// out from, the next time.
+struct Counters {
+    at: Instant,
+    cpu: u64,
+    system: u64,
+    /// None where the engine does not count them (a container with no network; the reads and writes, where its
+    /// cgroups do not say them): their rate unknown, not none.
+    net: Option<u64>,
+    io: Option<u64>,
+}
+
+/// The engine asked once: its containers running, each with what it uses
+/// (rates against what `before` holds of the last time).
+fn read(before: &mut HashMap<String, Counters>, asking: &Mutex<Option<Instant>>, stop: &AtomicBool) -> DockerSample {
+    let Endpoint { context, host } = endpoint();
+    let listed: Vec<Listed> = match ask(&host, "/containers/json", asking) {
+        Ok(Some(listed)) => listed,
+        Ok(None) => return DockerSample::Unsupported { context, host },
+        Err(_) => {
+            before.clear();
+            return DockerSample::Stopped { context };
+        }
+    };
+    let mut containers = Vec::new();
+    let mut kept = HashMap::new();
+    for container in listed {
+        // Switched off meanwhile: no more asked.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // An id as the engine makes them, or the answer is not the
+        // engine's: nothing else goes into a request.
+        if !is_container_id(&container.id) {
+            continue;
+        }
+        let name = container.names.first().map(|name| name.trim_start_matches('/').to_string()).unwrap_or_else(|| container.id.chars().take(12).collect());
+        let stats: Option<Stats> = ask(&host, &format!("/containers/{}/stats?stream=false&one-shot=true", container.id), asking).ok().flatten();
+        let Some(stats) = stats else {
+            containers.push(ContainerSample { name, status: container.status, cpu: None, mem: None, limit: None, net: None, io: None });
+            continue;
+        };
+        let now = Counters {
+            at: Instant::now(),
+            cpu: stats.cpu_stats.cpu_usage.total_usage,
+            system: stats.cpu_stats.system_cpu_usage.unwrap_or(0),
+            net: stats.networks.as_ref().map(|networks| networks.values().map(|n| n.rx_bytes + n.tx_bytes).sum()),
+            io: stats.blkio_stats.io_service_bytes_recursive.as_ref().map(|entries| {
+                entries.iter().filter(|e| e.op.eq_ignore_ascii_case("read") || e.op.eq_ignore_ascii_case("write")).map(|e| e.value).sum()
+            }),
+        };
+        // Its share of the machine's processors, and its rates, since the
+        // time before (none the first time it is seen).
+        let (cpu, net, io) = match before.get(&container.id) {
+            Some(was) => {
+                let seconds = now.at.duration_since(was.at).as_secs_f64().max(0.001);
+                let system = now.system.saturating_sub(was.system);
+                let cpu = (system > 0).then(|| (now.cpu.saturating_sub(was.cpu) as f64 / system as f64 * 100.0).clamp(0.0, 100.0) as f32);
+                let rate = |now: Option<u64>, was: Option<u64>| now.zip(was).map(|(now, was)| now.saturating_sub(was) as f64 / seconds);
+                (cpu, rate(now.net, was.net), rate(now.io, was.io))
+            }
+            None => (None, None, None),
+        };
+        // In use as the Docker CLI counts it: less the file cache it can drop.
+        let cache = stats.memory_stats.stats.get("inactive_file").or_else(|| stats.memory_stats.stats.get("total_inactive_file")).copied().unwrap_or(0);
+        let mem = stats.memory_stats.usage.map(|usage| usage.saturating_sub(cache));
+        containers.push(ContainerSample { name, status: container.status, cpu, mem, limit: stats.memory_stats.limit, net, io });
+        kept.insert(container.id, now);
+    }
+    *before = kept;
+    DockerSample::Running { context, containers }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuts_short_an_engine_that_does_not_answer() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT};
+        // An engine that takes the request and never answers.
+        // (A pipe of this test process's own: two test runs at once would meet on one name.)
+        let name = format!("glance-test-silent-{}", std::process::id());
+        let server = unsafe { CreateNamedPipeW(&windows::core::HSTRING::from(format!(r"\\.\pipe\{name}")), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, None) };
+        assert!(!server.is_invalid());
+        let asking = Arc::new(Mutex::new(None));
+        let busy = asking.clone();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || ask::<serde_json::Value>(&format!("npipe:////./pipe/{name}"), "/containers/json", &busy));
+        while asking.lock().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let thread = windows::Win32::Foundation::HANDLE(worker.as_raw_handle());
+        // Cut short, as `Docker::read` does once it has taken too long.
+        while !worker.is_finished() {
+            let _ = unsafe { windows::Win32::System::IO::CancelSynchronousIo(thread) };
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(started.elapsed() < Duration::from_secs(5), "the request was not cut short");
+        }
+        assert!(worker.join().unwrap().is_err());
+        assert!(asking.lock().unwrap().is_none());
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(server) };
+    }
+
+    #[test]
+    fn lets_a_pipe_server_identify_glance_and_no_more() {
+        use windows::Win32::Security::{GetTokenInformation, RevertToSelf, SecurityIdentification, TokenImpersonationLevel, SECURITY_IMPERSONATION_LEVEL, TOKEN_QUERY};
+        use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows::Win32::System::Pipes::{CreateNamedPipeW, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT};
+        use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        let name = format!("glance-test-identify-{}", std::process::id());
+        let server = unsafe { CreateNamedPipeW(&windows::core::HSTRING::from(format!(r"\\.\pipe\{name}")), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, None) };
+        assert!(!server.is_invalid());
+        let Some(Ok(Connection::Pipe(mut client))) = Connection::open(&format!("npipe:////./pipe/{name}")) else { panic!("not opened") };
+        // A byte from the client, so the server may impersonate it.
+        client.write_all(b"x").unwrap();
+        let mut byte = [0u8; 1];
+        let _ = unsafe { windows::Win32::Storage::FileSystem::ReadFile(server, Some(&mut byte), None, None) };
+        unsafe { ImpersonateNamedPipeClient(server) }.unwrap();
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) };
+        let mut level = SECURITY_IMPERSONATION_LEVEL::default();
+        let mut length = 0u32;
+        let read = opened.and_then(|_| unsafe { GetTokenInformation(token, TokenImpersonationLevel, Some(&mut level as *mut _ as *mut _), size_of::<SECURITY_IMPERSONATION_LEVEL>() as u32, &mut length) });
+        unsafe { RevertToSelf() }.unwrap();
+        read.unwrap();
+        assert_eq!(level, SecurityIdentification);
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(token) };
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(server) };
+    }
+
+    #[test]
+    fn takes_ids_as_docker_makes_them_alone() {
+        assert!(is_container_id("80e0444e7b3da5bf04062aae9bb387a6a5d41dda7e073448038ed5e19778e429"));
+        assert!(is_container_id("80e0444e7b3d"));
+        for not in ["", "80e0", "example HTTP/1.1
+POST /containers/x/stop", "../../info", "80e0444e7b3d/stop"] {
+            assert!(!is_container_id(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn opens_pipes_alone() {
+        assert_eq!(pipe_path("////./pipe/dockerDesktopLinuxEngine").as_deref(), Some(r"\\.\pipe\dockerDesktopLinuxEngine"));
+        assert_eq!(pipe_path("//./pipe/docker_engine").as_deref(), Some(r"\\.\pipe\docker_engine"));
+        for elsewhere in ["////?/C:/Windows/System32/drivers/etc/hosts", "////./pipe/../../C:/x", "////./pipe/a/b", "////server/pipe/x", "////./pipe/", "////./pipe/.."] {
+            assert_eq!(pipe_path(elsewhere), None, "{elsewhere}");
+        }
+    }
+
+    #[test]
+    fn bounds_an_answer() {
+        // An answer that goes on past the bound is no answer.
+        let mut endless = std::io::repeat(b'x');
+        let mut into = Vec::new();
+        assert!(read_all(&mut endless, &mut into).is_err());
+        assert!(into.len() <= MOST);
+    }
+
+    #[test]
+    fn joins_chunks() {
+        let answer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(parse(answer).unwrap(), (200, b"hello world".to_vec()));
+        let plain = b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}";
+        assert_eq!(parse(plain).unwrap(), (404, b"{}".to_vec()));
+    }
+
+    #[test]
+    #[ignore = "asks this machine's Docker engine, with containers running; run with --ignored"]
+    fn reads_docker() {
+        let (mut before, asking, stop) = (HashMap::new(), Mutex::new(None), AtomicBool::new(false));
+        for _ in 0..3 {
+            println!("{}", serde_json::to_string(&read(&mut before, &asking, &stop)).unwrap());
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(matches!(read(&mut before, &asking, &stop), DockerSample::Running { .. }));
+    }
+}

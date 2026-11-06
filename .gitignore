@@ -1,0 +1,31 @@
+target/
+__pycache__/
+
+# The editor's own state (workspace databases, browsed symbols), never the project's
+.vs/
+
+# What this PC's editor is told about the toolchain: where Rust and the MSVC SDK live here, which no other
+# machine reads the same way. The tasks beside it are the project's, and stay kept.
+.vscode/settings.json
+
+# Gradle's local state, rebuilt on every Android build
+.gradle/
+
+# Wrangler's local state (the site's count, run here)
+.wrangler/
+
+# Another project's archives, served by the site: fetched by scripts\site.ps1, not kept here
+website/dl/
+website/latest.json
+
+# What this PC leaves behind rather than what the project holds: a file kept aside, a run that spoke
+# into a log, an editor's or an explorer's own note about the folder
+*.bak
+*.tmp
+*.log
+*~
+Thumbs.db
+Desktop.ini
+.idea/
+*.user
+*.suo

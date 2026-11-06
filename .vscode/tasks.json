@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build (fast)",
+      "detail": "bash build.sh — MSVC 环境已由 build-env.sh 提供；冷编译约 80s，增量约 1s",
+      "type": "shell",
+      "command": "bash",
+      "args": ["build.sh"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "cargo build (release)",
+      "detail": "bash build.sh release — LTO + codegen-units=1，出货用",
+      "type": "shell",
+      "command": "bash",
+      "args": ["build.sh", "release"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "cargo check",
+      "detail": "只做类型检查，不链接，最快",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-lc", ". ./build-env.sh && cargo check --profile fast"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "run glance (dev build)",
+      "detail": "先编译再启动 target/fast/glance.exe。先退出已安装的 Glance，否则被单实例机制吞掉",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-lc", "./target/fast/glance.exe"],
+      "dependsOn": "cargo build (fast)",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "cargo clean",
+      "detail": "清掉 target\\（约 945 MB）",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["clean"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,1191 @@
+//! Each thing on the station's picture: a file's as Explorer shows it (its thumbnail: a picture's, a video's, a
+//! PDF's; else its icon), through the shell, on a thread of its own (a thumbnail may take a while to be made: never
+//! on a thread that draws), kept once made. And what a path is (a folder, a file and when it was last written, or
+//! nothing), looked at on a thread of its own too (a drive may be slow to answer, one on the network gone: never on a
+//! thread that draws), and looked at again a while after.
+
+use crate::ui::canvas::Picture;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+use windows::core::HSTRING;
+use windows::Win32::Foundation::SIZE;
+use windows::Win32::Graphics::Gdi::{
+    DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    HBITMAP, HGDIOBJ,
+};
+use windows::Win32::UI::Shell::{
+    IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    SIIGBF_RESIZETOFIT,
+};
+
+/// A picture: its pixels (BGRA, premultiplied, top row first) and how many across and down.
+#[derive(Clone, Debug)]
+struct Thumb {
+    pixels: Vec<u8>,
+    size: (u32, u32),
+}
+
+/// What a picture is asked for: the file, when it was last written (a file written again is pictured again), the
+/// side (physical px) it is to fill, and how (see `Made`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Key {
+    path: PathBuf,
+    written: Option<std::time::SystemTime>,
+    side: u32,
+    made: Made,
+}
+
+/// How a picture is made: as Explorer shows the file (its thumbnail, else its icon), its shape kept in the square;
+/// filling the square (a picture's middle, as much as the square holds: for a box it is to fill); its icon alone, as
+/// Explorer shows a file of its kind (not what it holds); its icon on a plate of its own colours where it is a thin
+/// glyph (a whole tile's picture, a modern app's, left as it is — see `on_plate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Made {
+    Fit,
+    Fill,
+    Icon,
+    Plate,
+}
+
+/// The most pictures kept (those asked for longest ago go first: never one drawn now, as a list turned through many
+/// others pictured, else the first made, quick launch's, went and showed none till made again). Past it, those asked
+/// for within `DRAWN_STILL` are kept too.
+const KEPT_MOST: usize = 256;
+
+struct Kept {
+    made: Used<Key, Picture>,
+    /// Those being made.
+    asked: HashSet<Key>,
+    /// Those the shell could not make, made again a while after (see `Failed`).
+    failed: HashMap<Key, Failed>,
+    /// What each path was found to be, and when; those being looked at.
+    looked: Used<PathBuf, (std::time::Instant, Looked)>,
+    looking: HashSet<PathBuf>,
+}
+
+/// A picture the shell could not make (a thumbnail maker busy or failing, the shell slow to answer while the PC is
+/// loaded: none of it says the file has no picture): when it was last tried, how long till it is tried again, and
+/// whether it was asked for since (one no longer drawn is not tried again, but made anew when next asked for).
+struct Failed {
+    at: std::time::Instant,
+    wait: std::time::Duration,
+    asked: bool,
+}
+
+/// How long after a picture first could not be made it is tried again; each time it fails again, twice as long, up to
+/// `TRY_AGAIN_MOST`. (Kept as failed for good, quick launch's pictures, failed once, showed letters till Glance
+/// was started again.)
+const TRY_AGAIN: std::time::Duration = std::time::Duration::from_secs(5);
+const TRY_AGAIN_MOST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long after it was last asked for a picture counts as drawn still: kept past `KEPT_MOST`. (More drawn at once
+/// than the most kept, each let go of as the next was made, then made again: every picture shown came and went, over
+/// and over.)
+const DRAWN_STILL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What is kept, as many as `most`: those asked for longest ago let go of first, as more come, but never one asked for
+/// within `fresh` (more than `most` kept while more are asked for at once).
+struct Used<K, V> {
+    kept: HashMap<K, (V, u64, std::time::Instant)>,
+    /// How many times one was asked for or kept, each so numbered.
+    asked: u64,
+    most: usize,
+    fresh: std::time::Duration,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> Used<K, V> {
+    fn new(most: usize, fresh: std::time::Duration) -> Used<K, V> {
+        Used {
+            kept: HashMap::new(),
+            asked: 0,
+            most,
+            fresh,
+        }
+    }
+
+    /// What is kept for `key`, asked for now.
+    fn get<Q: std::hash::Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.asked += 1;
+        let asked = self.asked;
+        self.kept.get_mut(key).map(|(value, when, at)| {
+            (*when, *at) = (asked, std::time::Instant::now());
+            &*value
+        })
+    }
+
+    /// `value` kept for `key`, asked for now, and past `most`, the one asked for longest ago let go of, where it was asked
+    /// for longer ago than `fresh`.
+    fn insert(&mut self, key: K, value: V) {
+        self.asked += 1;
+        self.kept
+            .insert(key, (value, self.asked, std::time::Instant::now()));
+        while self.kept.len() > self.most {
+            let Some((oldest, at)) = self
+                .kept
+                .iter()
+                .min_by_key(|(_, (_, when, _))| *when)
+                .map(|(key, (_, _, at))| (key.clone(), *at))
+            else {
+                break;
+            };
+            if at.elapsed() < self.fresh {
+                break;
+            }
+            self.kept.remove(&oldest);
+        }
+    }
+}
+
+/// What a path is: a folder; a file, when it was last written (as far as that is told); nothing (gone, or on a drive
+/// that is not there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Looked {
+    Folder,
+    File(Option<std::time::SystemTime>),
+    Gone,
+}
+
+/// How long what a path was found to be stands before it is looked at again.
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(3);
+/// The most paths kept looked at (those asked about longest ago let go of past it: looked at again as asked).
+const LOOKED_MOST: usize = 4096;
+
+static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
+static ASKS: OnceLock<Mutex<Sender<Key>>> = OnceLock::new();
+static LOOKS: OnceLock<Mutex<Sender<PathBuf>>> = OnceLock::new();
+/// Called (on the pictures' thread) as one is made.
+static TOLD: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+/// How many times a picture was made, or a path found to be other than it was (see `changes`).
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A picture made, or a path found to be other than it was: counted, and told.
+fn tell() {
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(told) = TOLD.get() {
+        told();
+    }
+}
+
+/// How many times a picture was made, or a path found to be other than it was, so far: for a drawing to tell that
+/// what it shows may have changed since, without asking for each picture it may show (asked for, those not shown
+/// were made too, and as many as there are files listed kept, those shown let go of to make room).
+pub fn changes() -> u64 {
+    CHANGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Starts the pictures' thread; `told` is called as each is made.
+pub fn start(told: impl Fn() + Send + Sync + 'static) {
+    let _ = TOLD.set(Box::new(told));
+    let (sender, asks) = std::sync::mpsc::channel();
+    if ASKS.set(Mutex::new(sender)).is_err() {
+        return;
+    }
+    *KEPT.lock().unwrap() = Some(Kept {
+        made: Used::new(KEPT_MOST, DRAWN_STILL),
+        asked: HashSet::new(),
+        failed: HashMap::new(),
+        looked: Used::new(LOOKED_MOST, LOOK_AGAIN),
+        looking: HashSet::new(),
+    });
+    std::thread::Builder::new()
+        .name("glance: station pictures".into())
+        .spawn(move || make(asks))
+        .expect("a thread started");
+    let (sender, looks) = std::sync::mpsc::channel();
+    let _ = LOOKS.set(Mutex::new(sender));
+    std::thread::Builder::new()
+        .name("glance: station files".into())
+        .spawn(move || look(looks))
+        .expect("a thread started");
+}
+
+/// What the path `path` is, as last looked at (none yet: asked, and told when it is); looked at again where that was
+/// a while ago (what it was standing meanwhile).
+pub fn looked(path: &Path) -> Option<Looked> {
+    let mut kept = KEPT.lock().unwrap();
+    let kept = kept.as_mut()?;
+    let found = kept.looked.get(path).copied();
+    if found.is_none_or(|(at, _)| at.elapsed() >= LOOK_AGAIN)
+        && kept.looking.insert(path.to_path_buf())
+    {
+        if let Some(looks) = LOOKS.get() {
+            let _ = looks.lock().unwrap().send(path.to_path_buf());
+        }
+    }
+    found.map(|(_, looked)| looked)
+}
+
+/// Paths looked at as they are asked for (see `looked`); told as what one is changed, or is first found.
+fn look(looks: Receiver<PathBuf>) {
+    while let Ok(path) = looks.recv() {
+        let found = match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => Looked::Folder,
+            Ok(meta) => Looked::File(meta.modified().ok()),
+            Err(_) => Looked::Gone,
+        };
+        let changed = {
+            let mut kept = KEPT.lock().unwrap();
+            let Some(kept) = kept.as_mut() else { continue };
+            kept.looking.remove(&path);
+            let changed = kept.looked.get(&path).is_none_or(|(_, was)| *was != found);
+            kept.looked.insert(path, (std::time::Instant::now(), found));
+            changed
+        };
+        if changed {
+            tell();
+        }
+    }
+}
+
+/// The picture of the file at `path`, `side` physical px square (its own shape in its middle): as made; none yet
+/// (asked for, and told when it is), or none to be had.
+pub fn of(path: &Path, side: u32) -> Option<Picture> {
+    asked(path, side, Made::Fit)
+}
+
+/// The picture of the picture at `path`, `side` physical px square, filling it (its middle).
+pub fn filling(path: &Path, side: u32) -> Option<Picture> {
+    asked(path, side, Made::Fill)
+}
+
+/// The icon of the file or folder at `path`, `side` physical px square: Windows' own for it (its program's for a
+/// file of a kind one opens, the folder's), as Explorer shows it.
+pub fn icon(path: &Path, side: u32) -> Option<Picture> {
+    asked(path, side, Made::Icon)
+}
+
+/// How much of the square a picture must fill to stand as a tile of its own, needing no plate: a modern app's icon
+/// is a coloured square already, and a plate behind it would only crowd its picture.
+const WHOLE: f32 = 0.72;
+/// How large an icon's glyph keeps on its plate, as the plate's own side.
+const GLYPH: f32 = 0.66;
+/// How far a plate's corners are rounded, as its side: the same a tile is rounded to as it is drawn (see
+/// `crate::ui::launchpad::CORNER`).
+const ROUND: f32 = 0.225;
+
+/// The icon of the file at `path`, a thin glyph set on a plate of its own colours as on a Mac's launchpad (a picture
+/// that is already a whole tile left as it is), `side` physical px square: none yet (asked for), none to be had.
+pub fn plated(path: &Path, side: u32) -> Option<Picture> {
+    asked(path, side, Made::Plate)
+}
+
+fn asked(path: &Path, side: u32, made: Made) -> Option<Picture> {
+    // (Pictured as it was last written: a file written again pictured again. Not yet looked at, none yet. A name
+    // that is not a path, a Store app's, is pictured as it is.)
+    let written = if path.is_absolute() {
+        match looked(path)? {
+            Looked::File(written) => written,
+            Looked::Folder | Looked::Gone => None,
+        }
+    } else {
+        None
+    };
+    let key = Key {
+        path: path.to_path_buf(),
+        written,
+        side,
+        made,
+    };
+    let mut kept = KEPT.lock().unwrap();
+    let kept = kept.as_mut()?;
+    if let Some(made) = kept.made.get(&key) {
+        return Some(made.clone());
+    }
+    // (One that could not be made is tried again in its time, as it is still asked for.)
+    if let Some(failed) = kept.failed.get_mut(&key) {
+        failed.asked = true;
+        return None;
+    }
+    if kept.asked.insert(key.clone()) {
+        if let Some(asks) = ASKS.get() {
+            let _ = asks.lock().unwrap().send(key);
+        }
+    }
+    None
+}
+
+fn make(asks: Receiver<Key>) {
+    // (The shell's thumbnail makers expect a single-threaded apartment.)
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+    }
+    loop {
+        // (Waiting for the next asked for, or till one that could not be made is to be tried again.)
+        let next = {
+            let kept = KEPT.lock().unwrap();
+            kept.as_ref().and_then(|kept| {
+                kept.failed
+                    .values()
+                    .map(|failed| failed.at + failed.wait)
+                    .min()
+            })
+        };
+        let asked = match next {
+            Some(next) => {
+                asks.recv_timeout(next.saturating_duration_since(std::time::Instant::now()))
+            }
+            None => asks
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match asked {
+            Ok(key) => make_one(key),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let due = {
+                    let mut kept = KEPT.lock().unwrap();
+                    let Some(kept) = kept.as_mut() else { continue };
+                    due(&mut kept.failed, std::time::Instant::now())
+                };
+                due.into_iter().for_each(make_one);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Those of `failed` due to be tried again by `now`: those asked for since, each kept failed till it is made; those
+/// not asked for since let go of (made anew when next asked for).
+fn due(failed: &mut HashMap<Key, Failed>, now: std::time::Instant) -> Vec<Key> {
+    let mut due = Vec::new();
+    failed.retain(|key, failed| {
+        if failed.at + failed.wait > now {
+            return true;
+        }
+        if failed.asked {
+            due.push(key.clone());
+        }
+        failed.asked
+    });
+    due
+}
+
+/// How `key` stands having failed at `now`, having failed before as `before`: tried again after twice as long as
+/// before (up to `TRY_AGAIN_MOST`), or after `TRY_AGAIN` the first time; asked for since, as it was just tried.
+fn failed_again(before: Option<&Failed>, now: std::time::Instant) -> Failed {
+    let wait = before.map_or(TRY_AGAIN, |before| (before.wait * 2).min(TRY_AGAIN_MOST));
+    Failed {
+        at: now,
+        wait,
+        asked: false,
+    }
+}
+
+/// The picture asked for as `key` made, kept, and told; one the shell could not make, kept as failed (see `Failed`),
+/// told too: what drew it draws again, asking for it, which keeps it tried.
+fn make_one(key: Key) {
+    let number = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    };
+    let made =
+        picture(&key.path, key.side, !matches!(key.made, Made::Fill)).map(|thumb| match key.made {
+            Made::Fill => squared(&middle(&thumb), key.side, number),
+            Made::Fit | Made::Icon => squared(&thumb, key.side, number),
+            Made::Plate => on_plate(squared(&thumb, key.side, number), number),
+        });
+    {
+        let mut kept = KEPT.lock().unwrap();
+        let Some(kept) = kept.as_mut() else { return };
+        kept.asked.remove(&key);
+        match made {
+            Ok(made) => {
+                kept.failed.remove(&key);
+                kept.made.insert(key, made);
+            }
+            Err(error) => {
+                let before = kept.failed.get(&key);
+                if before.is_none() {
+                    crate::journal::note(format!(
+                        "station: no picture of {} ({error}), tried again in a while",
+                        key.path.display()
+                    ));
+                }
+                let failed = failed_again(before, std::time::Instant::now());
+                kept.failed.insert(key, failed);
+            }
+        }
+    }
+    tell();
+}
+
+/// `thumb` made no larger than `side` square, its shape kept: each pixel of the smaller the mean of those of the larger
+/// in its box (the shell, asked for one size, may give a larger); one less than half as large made as large as fits
+/// (a Store app's icon comes small), each pixel between the four nearest.
+fn fitted(thumb: &Thumb, side: u32) -> std::borrow::Cow<'_, Thumb> {
+    let (w, h) = thumb.size;
+    if w.max(h) * 2 < side && w > 0 && h > 0 {
+        return std::borrow::Cow::Owned(enlarged(thumb, side));
+    }
+    if w <= side && h <= side {
+        return std::borrow::Cow::Borrowed(thumb);
+    }
+    let k = side as f64 / w.max(h) as f64;
+    let (to_w, to_h) = (
+        ((w as f64 * k).round() as u32).clamp(1, side),
+        ((h as f64 * k).round() as u32).clamp(1, side),
+    );
+    let mut pixels = vec![0u8; (to_w * to_h * 4) as usize];
+    for ty in 0..to_h {
+        let (y0, y1) = (ty * h / to_h, ((ty + 1) * h / to_h).max(ty * h / to_h + 1));
+        for tx in 0..to_w {
+            let (x0, x1) = (tx * w / to_w, ((tx + 1) * w / to_w).max(tx * w / to_w + 1));
+            let mut sum = [0u32; 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let at = ((y * w + x) * 4) as usize;
+                    for (channel, total) in sum.iter_mut().enumerate() {
+                        *total += u32::from(thumb.pixels[at + channel]);
+                    }
+                }
+            }
+            let count = (y1 - y0) * (x1 - x0);
+            let to = ((ty * to_w + tx) * 4) as usize;
+            for (channel, total) in sum.into_iter().enumerate() {
+                pixels[to + channel] = ((total + count / 2) / count) as u8;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(Thumb {
+        pixels,
+        size: (to_w, to_h),
+    })
+}
+
+/// `thumb` made as large as fits `side` square, its shape kept, each pixel blended from the four nearest of it.
+fn enlarged(thumb: &Thumb, side: u32) -> Thumb {
+    let (w, h) = thumb.size;
+    let k = side as f64 / w.max(h) as f64;
+    let (to_w, to_h) = (
+        ((w as f64 * k).round() as u32).clamp(1, side),
+        ((h as f64 * k).round() as u32).clamp(1, side),
+    );
+    let mut pixels = vec![0u8; (to_w * to_h * 4) as usize];
+    let at = |x: u32, y: u32, channel: usize| {
+        f64::from(thumb.pixels[((y * w + x) * 4) as usize + channel])
+    };
+    for ty in 0..to_h {
+        let sy = ((ty as f64 + 0.5) / k - 0.5).clamp(0.0, (h - 1) as f64);
+        let (y0, fy) = (sy.floor() as u32, sy.fract());
+        let y1 = (y0 + 1).min(h - 1);
+        for tx in 0..to_w {
+            let sx = ((tx as f64 + 0.5) / k - 0.5).clamp(0.0, (w - 1) as f64);
+            let (x0, fx) = (sx.floor() as u32, sx.fract());
+            let x1 = (x0 + 1).min(w - 1);
+            let to = ((ty * to_w + tx) * 4) as usize;
+            for channel in 0..4 {
+                let top = at(x0, y0, channel) * (1.0 - fx) + at(x1, y0, channel) * fx;
+                let bottom = at(x0, y1, channel) * (1.0 - fx) + at(x1, y1, channel) * fx;
+                pixels[to + channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+            }
+        }
+    }
+    Thumb {
+        pixels,
+        size: (to_w, to_h),
+    }
+}
+
+/// `thumb` without the clear rows and columns round what it shows (an icon is drawn within room round it, a Store app's
+/// in much room): what it shows made as large as the tile, as every picture's is.
+fn trimmed(thumb: &Thumb) -> std::borrow::Cow<'_, Thumb> {
+    let (w, h) = thumb.size;
+    let seen = |x: u32, y: u32| thumb.pixels[((y * w + x) * 4 + 3) as usize] > 0;
+    let rows: Vec<u32> = (0..h).filter(|y| (0..w).any(|x| seen(x, *y))).collect();
+    let columns: Vec<u32> = (0..w).filter(|x| (0..h).any(|y| seen(*x, y))).collect();
+    let (Some(&top), Some(&bottom), Some(&left), Some(&right)) =
+        (rows.first(), rows.last(), columns.first(), columns.last())
+    else {
+        return std::borrow::Cow::Borrowed(thumb);
+    };
+    if (top, left, bottom, right) == (0, 0, h - 1, w - 1) {
+        return std::borrow::Cow::Borrowed(thumb);
+    }
+    let (to_w, to_h) = (right - left + 1, bottom - top + 1);
+    let pixels = (top..=bottom)
+        .flat_map(|y| {
+            thumb.pixels[((y * w + left) * 4) as usize..((y * w + right + 1) * 4) as usize]
+                .iter()
+                .copied()
+        })
+        .collect();
+    std::borrow::Cow::Owned(Thumb {
+        pixels,
+        size: (to_w, to_h),
+    })
+}
+
+/// `thumb` in the middle of a square `side` across (made smaller to fit where it is larger), clear round it, as a
+/// picture known by `key`.
+fn squared(thumb: &Thumb, side: u32, key: u64) -> Picture {
+    let thumb = trimmed(thumb);
+    let thumb = fitted(&thumb, side);
+    let (w, h) = thumb.size;
+    let (left, top) = ((side - w) / 2, (side - h) / 2);
+    let mut pixels = vec![0u8; (side * side * 4) as usize];
+    for row in 0..h {
+        let from = (row * thumb.size.0 * 4) as usize;
+        let to = (((top + row) * side + left) * 4) as usize;
+        pixels[to..to + (w * 4) as usize]
+            .copy_from_slice(&thumb.pixels[from..from + (w * 4) as usize]);
+    }
+    Picture {
+        key,
+        side,
+        pixels: Arc::new(pixels),
+    }
+}
+
+/// The square in the middle of `thumb`, as large as it holds (what fills a square of its picture).
+fn middle(thumb: &Thumb) -> Thumb {
+    let (w, h) = thumb.size;
+    let side = w.min(h);
+    let (left, top) = ((w - side) / 2, (h - side) / 2);
+    let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+    for row in top..top + side {
+        let from = ((row * w + left) * 4) as usize;
+        pixels.extend_from_slice(&thumb.pixels[from..from + (side * 4) as usize]);
+    }
+    Thumb {
+        pixels,
+        size: (side, side),
+    }
+}
+
+/// `made` (the icon of a program, squared as drawn) set on a plate of its own colours, as on a Mac's launchpad:
+/// where its border is drawn near and dear — a modern app's icon, a coloured tile of itself — it is left exactly as
+/// it was; where it is a thin glyph in clear room, the glyph is drawn back `GLYPH` of the side on a rounded plate
+/// tinted from the glyph's own colours, lighter at its top than at its bottom, with a hairline of light within its
+/// top edge and a shade along its bottom. Its corners are rounded as a tile's are as it is drawn (see
+/// `crate::ui::launchpad::CORNER`), so the plate shows as a tile among them.
+fn on_plate(made: Picture, number: u64) -> Picture {
+    let side = made.side as usize;
+    let Some(side) = (side >= 8).then_some(side) else {
+        return made;
+    };
+    let at = |x: usize, y: usize| {
+        let from = (y * side + x) * 4;
+        [
+            made.pixels[from] as f32,
+            made.pixels[from + 1] as f32,
+            made.pixels[from + 2] as f32,
+            made.pixels[from + 3] as f32,
+        ]
+    };
+    // (How much of the square the picture fills, and the colour of what it does fill: its pixels are premultiplied
+    // BGRA, so each colour is taken back to what it is under its alpha before it is weighed in.)
+    let (mut red, mut green, mut blue, mut weighed, mut drawn) =
+        (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0usize);
+    for y in 0..side {
+        for x in 0..side {
+            let (b, g, r, a) = (at(x, y)[0], at(x, y)[1], at(x, y)[2], at(x, y)[3]);
+            if a > 128.0 {
+                drawn += 1;
+                red += r * 255.0 / a;
+                green += g * 255.0 / a;
+                blue += b * 255.0 / a;
+                weighed += 1.0;
+            }
+        }
+    }
+    if weighed == 0.0 || drawn as f32 / (side * side) as f32 > WHOLE {
+        // (A tile of its own, drawn near and dear across the square: a plate behind it would only crowd the picture
+        // the shell made, whose corners are rounded as it is drawn.)
+        return made;
+    }
+    let (red, green, blue) = (
+        (red / weighed).clamp(0.0, 255.0) / 255.0,
+        (green / weighed).clamp(0.0, 255.0) / 255.0,
+        (blue / weighed).clamp(0.0, 255.0) / 255.0,
+    );
+    // (The plate's colour: the glyph's, laid off towards grey and lifted towards a middle brightness — where the
+    // glyph is near white, hardly a tint at all; where near black, a dark one.)
+    let light = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    let (mut pr, mut pg, mut pb) = (
+        red + (light - red) * 0.55,
+        green + (light - green) * 0.55,
+        blue + (light - blue) * 0.55,
+    );
+    let lift = 0.62 - (0.2126 * pr + 0.7152 * pg + 0.0722 * pb);
+    for c in [&mut pr, &mut pg, &mut pb] {
+        *c = (*c + lift).clamp(0.08, 0.94);
+    }
+    let (radius, ring) = (side as f32 * ROUND, (side as f32 / 64.0).max(1.0));
+    let (left, glyph) = (side as f32 * (1.0 - GLYPH) / 2.0, GLYPH);
+    let k = 1.0 / glyph;
+    let over = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let whole = |one: f32| one.clamp(0.0, 1.0);
+    let mix = |a: [f32; 4], b: [f32; 4], t: f32| {
+        [
+            over(a[0], b[0], t),
+            over(a[1], b[1], t),
+            over(a[2], b[2], t),
+            over(a[3], b[3], t),
+        ]
+    };
+    // (How far a point stands outside the plate's rounded square: within it negative, without positive — the plate
+    // itself, the light within its top edge, and the shade along its bottom all read off this one distance.)
+    let reach = |x: f32, y: f32| {
+        let (cx, cy) = (
+            radius.max(x.min(side as f32 - radius)),
+            radius.max(y.min(side as f32 - radius)),
+        );
+        (x - cx).hypot(y - cy) - radius
+    };
+    let mut pixels = vec![0u8; side * side * 4];
+    for y in 0..side {
+        // (The plate's colour between its top's and its bottom's, in the order it is drawn in: BGRA.)
+        let tone = y as f32 / (side - 1) as f32;
+        let shade = over(1.10, 0.84, tone).min(1.0);
+        let (cb, cg, cr) = (pb * shade * 255.0, pg * shade * 255.0, pr * shade * 255.0);
+        for x in 0..side {
+            let d = reach(x as f32 + 0.5, y as f32 + 0.5);
+            // (Its corner: whole within, cut with a soft edge a pixel and a half wide, clear beyond.)
+            let mask = whole(0.5 - d * 0.75);
+            if mask <= 0.0 {
+                continue;
+            }
+            // (A hairline of light within its top edge, and a shade along its bottom — the plate a tile among tiles,
+            // with the light falling on it from before.)
+            let lit = whole(1.0 - (d + ring).abs() / ring);
+            let glint = lit * whole(y as f32 / (side as f32 * 0.6)) * 0.30;
+            let dark = lit * whole((y as f32 - side as f32 * 0.55) / (side as f32 * 0.4)) * 0.18;
+            let (mut cb, mut cg, mut cr) = (cb, cg, cr);
+            for c in [&mut cb, &mut cg, &mut cr] {
+                *c = over(over(*c, 250.0, glint), 0.0, dark);
+            }
+            // (The glyph between the plate and the light: premultiplied, as every picture's pixels are, and drawn
+            // back bilinear from the region of the tile it keeps to itself.)
+            let (sx, sy) = ((x as f32 - left) * k, (y as f32 - left) * k);
+            let four = || {
+                if sx < 0.0 || sy < 0.0 || sx > (side - 1) as f32 || sy > (side - 1) as f32 {
+                    return [0.0f32; 4];
+                }
+                let (x0, y0) = (sx as usize, sy as usize);
+                let (x1, y1) = ((x0 + 1).min(side - 1), (y0 + 1).min(side - 1));
+                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+                mix(
+                    mix(at(x0, y0), at(x1, y0), fx),
+                    mix(at(x0, y1), at(x1, y1), fx),
+                    fy,
+                )
+            };
+            let g4 = four();
+            let (ga, one) = (g4[3] / 255.0, 1.0 - g4[3] / 255.0);
+            let a = mask + ga * (1.0 - mask);
+            let (mut b, mut g, mut r) = (
+                g4[0] + cb * mask * one,
+                g4[1] + cg * mask * one,
+                g4[2] + cr * mask * one,
+            );
+            for c in [&mut b, &mut g, &mut r] {
+                *c = c.min(255.0 * a);
+            }
+            let to = (y * side + x) * 4;
+            for value in [b, g, r, a * 255.0]
+                .into_iter()
+                .zip(&mut pixels[to..to + 4])
+            {
+                *value.1 = value.0.clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+    Picture {
+        key: number,
+        side: side as u32,
+        pixels: std::sync::Arc::new(pixels),
+    }
+}
+
+/// The picture of the file at `path`, as large as fits `side` square (its shape kept), as Explorer shows it (`icon`:
+/// its icon alone); else what went wrong.
+fn picture(path: &Path, side: u32, icon: bool) -> Result<Thumb, String> {
+    unsafe {
+        // (A program the Start menu names by its file's path, "shell:AppsFolder\D:\App\a.exe", which the shell
+        // does not read by that name: by the file itself.)
+        let named = path.to_string_lossy();
+        let path = match named.strip_prefix("shell:AppsFolder\\").map(Path::new) {
+            Some(file) if file.is_absolute() => file.to_path_buf(),
+            // (Its parts joined as Windows writes paths: the shell does not read one written with '/'.)
+            _ => path.components().collect(),
+        };
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
+                .map_err(|error| format!("the shell found no item: {error}"))?;
+        let side = side.max(16) as i32;
+        let how = if icon {
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK
+        } else {
+            SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK
+        };
+        let bitmap = factory
+            .GetImage(SIZE { cx: side, cy: side }, how)
+            .map_err(|error| format!("the shell gave no picture: {error}"))?;
+        let thumb = pixels_of(bitmap);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        thumb
+    }
+}
+
+/// A bitmap's pixels (32 bits, BGRA), top row first, premultiplied as they are drawn: the shell makes them straight, each
+/// colour whole whatever its alpha (taken as premultiplied, an icon's soft edge came out light, a white rim round it).
+unsafe fn pixels_of(bitmap: HBITMAP) -> Result<Thumb, String> {
+    unsafe {
+        let mut described = BITMAP::default();
+        if GetObjectW(
+            HGDIOBJ(bitmap.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut described as *mut BITMAP).cast()),
+        ) == 0
+        {
+            return Err("the shell's picture could not be described".into());
+        }
+        let (w, h) = (described.bmWidth, described.bmHeight.abs());
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let screen = windows::Win32::Graphics::Gdi::GetDC(None);
+        let lines = GetDIBits(
+            screen,
+            bitmap,
+            0,
+            h as u32,
+            Some(pixels.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        windows::Win32::Graphics::Gdi::ReleaseDC(None, screen);
+        if lines != h {
+            return Err(format!(
+                "{lines} of the shell's picture's {h} rows were read: {}",
+                windows::core::Error::from_thread()
+            ));
+        }
+        // (A picture with no alpha of its own, as an icon of old may be, wholly opaque.)
+        if described.bmBitsPixel != 32 || pixels.chunks_exact(4).all(|pixel| pixel[3] == 0) {
+            pixels.chunks_exact_mut(4).for_each(|pixel| pixel[3] = 255);
+        }
+        for pixel in pixels.chunks_exact_mut(4) {
+            let alpha = u32::from(pixel[3]);
+            for colour in &mut pixel[..3] {
+                *colour = ((u32::from(*colour) * alpha + 127) / 255) as u8;
+            }
+        }
+        Ok(Thumb {
+            pixels,
+            size: (w as u32, h as u32),
+        })
+    }
+}
+
+#[cfg(test)]
+mod made {
+    use super::*;
+
+    /// A picture the shell could not make is tried again in a while, then twice as long after each time it fails again,
+    /// up to the most: never kept as failed for good (a moment the shell failed once, a letter shown till Glance was
+    /// started again). One no longer asked for is let go of, not tried.
+    #[test]
+    fn a_picture_that_could_not_be_made_is_tried_again() {
+        let key = |name: &str| Key {
+            path: PathBuf::from(name),
+            written: None,
+            side: 64,
+            made: Made::Icon,
+        };
+        let start = std::time::Instant::now();
+        let first = failed_again(None, start);
+        assert_eq!(first.wait, TRY_AGAIN);
+        let mut wait = first.wait;
+        for _ in 0..10 {
+            wait = failed_again(
+                Some(&Failed {
+                    at: start,
+                    wait,
+                    asked: true,
+                }),
+                start,
+            )
+            .wait;
+        }
+        assert_eq!(wait, TRY_AGAIN_MOST);
+        assert_eq!(
+            failed_again(
+                Some(&Failed {
+                    at: start,
+                    wait: TRY_AGAIN,
+                    asked: true
+                }),
+                start
+            )
+            .wait,
+            TRY_AGAIN * 2
+        );
+
+        let mut failed = HashMap::new();
+        failed.insert(
+            key("shown"),
+            Failed {
+                asked: true,
+                ..failed_again(None, start)
+            },
+        );
+        failed.insert(key("gone from view"), failed_again(None, start));
+        failed.insert(
+            key("later"),
+            Failed {
+                at: start,
+                wait: TRY_AGAIN * 4,
+                asked: true,
+            },
+        );
+        assert!(due(&mut failed, start).is_empty());
+        assert_eq!(failed.len(), 3);
+        assert_eq!(due(&mut failed, start + TRY_AGAIN), vec![key("shown")]);
+        assert!(failed.contains_key(&key("shown")) && failed.contains_key(&key("later")));
+        assert!(!failed.contains_key(&key("gone from view")));
+    }
+
+    /// Those kept are let go of as they were last asked for, not as they were made: one asked for all along stays
+    /// as many more come and go.
+    #[test]
+    fn what_is_asked_for_all_along_is_kept() {
+        let mut used = Used::new(3, std::time::Duration::ZERO);
+        used.insert("quick launch", 0);
+        for file in 1..10 {
+            assert_eq!(used.get(&"quick launch"), Some(&0), "after {file}");
+            used.insert(
+                ["a", "b", "c", "d", "e", "f", "g", "h", "i"][file - 1],
+                file,
+            );
+        }
+        assert_eq!(used.get(&"quick launch"), Some(&0));
+        assert_eq!(used.get(&"h"), Some(&8));
+        assert_eq!(used.get(&"i"), Some(&9));
+        assert_eq!(used.get(&"g"), None);
+        assert_eq!(used.kept.len(), 3);
+    }
+
+    /// More asked for at once than the most kept: none let go of while it was asked for lately (each let go of as the
+    /// next came, every picture drawn went and was made again, over and over), those asked for long ago let go of then.
+    #[test]
+    fn what_is_drawn_now_is_kept_past_the_most() {
+        let mut used = Used::new(3, std::time::Duration::from_millis(200));
+        for file in 0..5 {
+            used.insert(file, file);
+        }
+        assert_eq!(used.kept.len(), 5);
+        assert!((0..5).all(|file| used.get(&file) == Some(&file)));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        used.get(&4);
+        used.insert(5, 5);
+        assert_eq!(used.kept.len(), 3);
+        assert_eq!(used.get(&4), Some(&4));
+        assert_eq!(used.get(&5), Some(&5));
+        assert_eq!(used.get(&0), None);
+    }
+
+    /// A thumbnail larger than the side asked for is made smaller to fit, its shape and colours kept, and centred:
+    /// never cut down to its corner.
+    #[test]
+    fn a_larger_thumbnail_is_fitted_whole() {
+        // 256 × 128: its left half red, its right half blue (BGRA).
+        let pixels = (0..128)
+            .flat_map(|_| {
+                (0..256).flat_map(|x| {
+                    if x < 128 {
+                        [0, 0, 255, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    }
+                })
+            })
+            .collect();
+        let picture = squared(
+            &Thumb {
+                pixels,
+                size: (256, 128),
+            },
+            128,
+            7,
+        );
+        let at = |x: u32, y: u32| {
+            &picture.pixels[((y * 128 + x) * 4) as usize..((y * 128 + x) * 4 + 4) as usize]
+        };
+        // 128 × 64 in the middle: clear above and below, red on its left, blue on its right.
+        assert_eq!(at(10, 10), [0, 0, 0, 0]);
+        assert_eq!(at(10, 64), [0, 0, 255, 255]);
+        assert_eq!(at(120, 64), [255, 0, 0, 255]);
+        assert_eq!(at(120, 120), [0, 0, 0, 0]);
+    }
+
+    /// An icon drawn small in much clear room is made as large as the tile: the clear room taken off first.
+    #[test]
+    fn an_icon_in_much_room_fills_the_tile() {
+        // 128 × 128, clear but for 16 × 16 red in its middle.
+        let pixels = (0..128u32)
+            .flat_map(|y| {
+                (0..128u32).flat_map(move |x| {
+                    if (56..72).contains(&x) && (56..72).contains(&y) {
+                        [0, 0, 255, 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    }
+                })
+            })
+            .collect();
+        let picture = squared(
+            &Thumb {
+                pixels,
+                size: (128, 128),
+            },
+            128,
+            7,
+        );
+        assert_eq!(
+            &picture.pixels[((4 * 128 + 4) * 4) as usize..((4 * 128 + 4) * 4 + 4) as usize],
+            [0, 0, 255, 255]
+        );
+    }
+
+    /// A thumbnail less than half as large as the side asked for is made as large as fits, its colours kept.
+    #[test]
+    fn a_small_thumbnail_is_made_larger() {
+        let pixels = (0..16)
+            .flat_map(|_| {
+                (0..32).flat_map(|x| {
+                    if x < 16 {
+                        [0, 0, 255, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    }
+                })
+            })
+            .collect();
+        let picture = squared(
+            &Thumb {
+                pixels,
+                size: (32, 16),
+            },
+            128,
+            7,
+        );
+        let at = |x: u32, y: u32| {
+            &picture.pixels[((y * 128 + x) * 4) as usize..((y * 128 + x) * 4 + 4) as usize]
+        };
+        // 128 × 64 in the middle.
+        assert_eq!(at(10, 10), [0, 0, 0, 0]);
+        assert_eq!(at(10, 64), [0, 0, 255, 255]);
+        assert_eq!(at(120, 64), [255, 0, 0, 255]);
+    }
+
+    /// A thin glyph in clear room is set on a plate of its own: the plate drawn where the tile's corners are not,
+    /// its colour the glyph's laid off and lifted, the glyph kept whole in its middle.
+    #[test]
+    fn a_glyph_stands_on_a_plate() {
+        // A blue cross drawn in a 128² of clear room: its border all clear, so a plate is asked for.
+        let pixels = (0..128u32)
+            .flat_map(|y| {
+                (0..128u32).flat_map(move |x| {
+                    if (56..72).contains(&x) && (40..88).contains(&y)
+                        || (52..76).contains(&y) && (40..88).contains(&x)
+                    {
+                        [230, 40, 20, 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    }
+                })
+            })
+            .collect();
+        let plate = on_plate(
+            Picture {
+                key: 7,
+                side: 128,
+                pixels: Arc::new(pixels),
+            },
+            9,
+        );
+        let at = |x: u32, y: u32| {
+            &plate.pixels[((y * 128 + x) * 4) as usize..((y * 128 + x) * 4 + 4) as usize]
+        };
+        // Its corner past the rounding: clear; its edge within it: the plate, drawn whole.
+        assert_eq!(at(1, 1), [0, 0, 0, 0]);
+        assert!(at(64, 2)[3] > 200, "the plate's edge is drawn");
+        // Where the glyph was and is not: the plate of its own blue, laid off and lifted — a lit mid-blue, not the
+        // glyph's dark one, and bluer than red by far.
+        let (b, g, r, a) = (at(12, 64)[0], at(12, 64)[1], at(12, 64)[2], at(12, 64)[3]);
+        assert!(a > 250 && b > r + 40 && b > 120, "{:?}", at(12, 64));
+        assert!(g < b && r < b, "{:?}", at(12, 64));
+        // The glyph itself, whole in its middle, still the colour it was.
+        assert!(
+            at(64, 64)[2] < 60 && at(64, 64)[0] > 180,
+            "{:?}",
+            at(64, 64)
+        );
+    }
+
+    /// A picture that is a tile of itself — drawn along its whole border, a modern app's icon — is left exactly as
+    /// the shell gave it: no plate behind a tile.
+    #[test]
+    fn a_tile_is_left_a_tile() {
+        // A red rounded square filling the tile but for its corners: its border drawn near and dear.
+        let radius: f32 = 128.0 * 0.25;
+        let pixels = (0..128u32)
+            .flat_map(|y| {
+                (0..128u32).flat_map(move |x| {
+                    let (xf, yf) = (x as f32, y as f32);
+                    let (cx, cy) = (
+                        radius.max(xf.min(127.0 - radius)),
+                        radius.max(yf.min(127.0 - radius)),
+                    );
+                    if (xf - cx).hypot(yf - cy) - radius < 0.0 {
+                        [0, 0, 255, 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    }
+                })
+            })
+            .collect();
+        let was = Picture {
+            key: 7,
+            side: 128,
+            pixels: Arc::new(pixels),
+        };
+        let left = on_plate(was.clone(), 9);
+        assert_eq!(&left.pixels[..], &was.pixels[..]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A picture's file gives its picture, another file its icon; each within the side asked for.
+    #[test]
+    #[ignore = "asks this PC's shell"]
+    fn files_are_pictured_as_explorer_shows_them() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let picture = super::picture(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/128x128@2x.png")),
+            96,
+            false,
+        )
+        .expect("a picture's");
+        assert!(
+            picture.size.0 <= 96
+                && picture.size.1 <= 96
+                && picture.size.0.max(picture.size.1) >= 48,
+            "{:?}",
+            picture.size
+        );
+        let icon = super::picture(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")),
+            48,
+            false,
+        )
+        .expect("an icon");
+        assert!(icon.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        println!("picture {:?}, icon {:?}", picture.size, icon.size);
+    }
+
+    /// A program's icon, its edges soft, as it is drawn: premultiplied, no colour past its alpha (where one was, it was
+    /// drawn lighter than it is, a white rim round the icon).
+    #[test]
+    #[ignore = "asks this PC's shell"]
+    fn an_icon_s_soft_edges_are_drawn_as_soft() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let windows = std::env::var("SystemRoot").unwrap();
+        let icon = super::picture(
+            &std::path::Path::new(&windows).join("explorer.exe"),
+            96,
+            true,
+        )
+        .expect("its icon");
+        let soft = icon
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            .count();
+        let past = icon
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3].iter().any(|colour| *colour > pixel[3]))
+            .count();
+        assert!(soft > 0, "no soft edge to look at");
+        assert_eq!(
+            past, 0,
+            "of {soft} pixels at its soft edges, {past} have a colour past their alpha"
+        );
+    }
+
+    /// What share of the square this PC's own program icons fill: the read that sets `WHOLE`, the line between a
+    /// glyph that wants a plate and a tile that does not. Printed, not asserted — it asks the shell of the PC it runs
+    /// on, whose icons differ machine to machine.
+    #[test]
+    #[ignore = "asks this PC's shell"]
+    fn what_share_of_the_square_real_icons_fill() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+        let windows = std::env::var("SystemRoot").unwrap();
+        for name in [
+            "explorer.exe",
+            "notepad.exe",
+            "mspaint.exe",
+            "calc.exe",
+            "wordpad.exe",
+        ] {
+            let path = std::path::Path::new(&windows).join(name);
+            let thumb = super::picture(&path, 128, true);
+            let Ok(thumb) = thumb else {
+                println!("{name}: no icon");
+                continue;
+            };
+            // (Squared as the tile is filled: the share of the whole 128² square drawn, which is what `on_plate`
+            // weighs against `WHOLE` — the trimmed bounding box is padded back to the side first.)
+            let made = super::squared(&thumb, 128, 1);
+            let filled = made.pixels.chunks_exact(4).filter(|p| p[3] > 128).count();
+            let share = filled as f32 / (128 * 128) as f32;
+            // (Whether `on_plate` indeed leaves a full square be and plates a thin one: the read against the share.)
+            let left = super::on_plate(made.clone(), 2).pixels == made.pixels;
+            println!(
+                "{name}: fills {:.0}% of the square -> {}",
+                share * 100.0,
+                if left {
+                    "a tile left be"
+                } else {
+                    "a plate asked for"
+                }
+            );
+        }
+    }
+}
